@@ -1,6 +1,11 @@
 import express from "express";
 import { z } from "zod";
-import { chromium } from "playwright";
+// 改用 puppeteer-extra 以繞過偵測
+import puppeteer from "puppeteer-extra";
+import StealthPlugin from "puppeteer-extra-plugin-stealth";
+
+// 啟用隱身模式
+puppeteer.use(StealthPlugin());
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
@@ -9,15 +14,12 @@ app.get("/health", (_req, res) => res.json({ ok: true }));
 
 const schema = z.object({ url: z.string().url() });
 
+// --- 保留你原本優秀的解析邏輯 Start ---
 function parseCompactNumber(input) {
   if (!input) return null;
   let s = String(input).trim();
-
-  // remove commas/spaces
   s = s.replace(/,/g, "").replace(/\s+/g, "");
 
-  // Chinese units
-  // 1.2萬 / 1萬 / 2億 / 2.3亿 / 1.1万
   const mZh = s.match(/^(\d+(?:\.\d+)?)(萬|万|億|亿)$/);
   if (mZh) {
     const n = Number(mZh[1]);
@@ -27,7 +29,6 @@ function parseCompactNumber(input) {
     if (unit === "億" || unit === "亿") return Math.round(n * 1e8);
   }
 
-  // K/M/B units
   const mEn = s.match(/^(\d+(?:\.\d+)?)([KMB])$/i);
   if (mEn) {
     const n = Number(mEn[1]);
@@ -38,19 +39,16 @@ function parseCompactNumber(input) {
     if (unit === "B") return Math.round(n * 1e9);
   }
 
-  // plain number
   const n = Number(s);
   if (Number.isFinite(n)) return Math.round(n);
   return null;
 }
 
 function extractCountsFromHtml(html) {
-  // 先抓最常見的三個
   const mFollowers = html.match(/"edge_followed_by"\s*:\s*\{\s*"count"\s*:\s*(\d+)\s*\}/);
   const mFollowing = html.match(/"edge_follow"\s*:\s*\{\s*"count"\s*:\s*(\d+)\s*\}/);
   const mPosts = html.match(/"edge_owner_to_timeline_media"\s*:\s*\{\s*"count"\s*:\s*(\d+)\s*\}/);
 
-  // 某些版本可能是 follower_count / following_count / media_count
   const mFollowers2 = html.match(/"follower_count"\s*:\s*(\d+)/);
   const mFollowing2 = html.match(/"following_count"\s*:\s*(\d+)/);
   const mPosts2 = html.match(/"media_count"\s*:\s*(\d+)/);
@@ -63,16 +61,12 @@ function extractCountsFromHtml(html) {
 }
 
 function extractCountsFromMetaText(raw) {
-  // raw 可能是 "1,234 Followers, 56 Following, 78 Posts - ..."
-  // 或其他語系。這裡同時支援英文 + 中文常見寫法
   const out = { followers: null, following: null, posts: null };
 
-  // English
   const f1 = raw.match(/([\d.,]+[KMB]?|\d+(?:\.\d+)?[KMB]?)\s*Followers/i);
   const f2 = raw.match(/([\d.,]+[KMB]?|\d+(?:\.\d+)?[KMB]?)\s*Following/i);
   const f3 = raw.match(/([\d.,]+[KMB]?|\d+(?:\.\d+)?[KMB]?)\s*Posts/i);
 
-  // Chinese: "1.2萬 位粉絲" / "追蹤中 123" / "貼文 45"
   const z1 = raw.match(/([\d.,]+(?:\.\d+)?(?:萬|万|億|亿)?)\s*(?:位)?粉絲/);
   const z2 = raw.match(/追蹤中?\s*([\d.,]+(?:\.\d+)?(?:萬|万|億|亿)?)/);
   const z3 = raw.match(/貼文\s*([\d.,]+(?:\.\d+)?(?:萬|万|億|亿)?)/);
@@ -87,6 +81,7 @@ function extractCountsFromMetaText(raw) {
 
   return out;
 }
+// --- 保留解析邏輯 End ---
 
 app.post("/profile", async (req, res) => {
   const parsed = schema.safeParse(req.body);
@@ -99,39 +94,57 @@ app.post("/profile", async (req, res) => {
 
   let browser;
   try {
-    browser = await chromium.launch({
-      args: ["--no-sandbox", "--disable-dev-shm-usage"],
-      headless: true,
+    // 啟動 Puppeteer (Stealth 模式自動生效)
+    browser = await puppeteer.launch({
+      headless: "new",
+      args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
     });
 
-    const context = await browser.newContext({
-      locale: "en-US",
-      userAgent:
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36",
-      extraHTTPHeaders: {
-        "Accept-Language": "en-US,en;q=0.9",
-      },
-      viewport: { width: 1280, height: 720 },
+    const page = await browser.newPage();
+
+    // 優化：設定 Viewport 與 Header
+    await page.setViewport({ width: 1280, height: 800 });
+    await page.setExtraHTTPHeaders({
+      "Accept-Language": "en-US,en;q=0.9",
     });
 
-    const page = await context.newPage();
+    // --- 關鍵修改：注入 Session Cookie ---
+    // 在 Zeabur 環境變數設定 IG_SESSION_ID
+    if (process.env.IG_SESSION_ID) {
+      console.log("Injecting Session Cookie...");
+      await page.setCookie({
+        name: "sessionid",
+        value: process.env.IG_SESSION_ID,
+        domain: ".instagram.com",
+        path: "/",
+        secure: true,
+        httpOnly: true,
+      });
+    } else {
+      console.log("WARNING: No IG_SESSION_ID provided. Scraping might fail.");
+    }
 
-    // 加速 & 少被擋：阻擋圖片/字型/影片
-    await page.route("**/*", (route) => {
-      const rt = route.request().resourceType();
-      if (["image", "media", "font"].includes(rt)) return route.abort();
-      return route.continue();
+    // 攔截資源請求以加速 (圖片、字型、樣式表)
+    await page.setRequestInterception(true);
+    page.on("request", (req) => {
+      if (["image", "font", "media", "stylesheet"].includes(req.resourceType())) {
+        req.abort();
+      } else {
+        req.continue();
+      }
     });
 
-    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45000 });
+    // 導航到頁面
+    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60000 });
 
-    // 如果被導去 login，直接回報（讓你 n8n 可做 fallback）
+    // 檢查是否仍被導向登入頁
     const finalUrl = page.url();
     const looksLogin =
       finalUrl.includes("/accounts/login") ||
       finalUrl.includes("/login") ||
       finalUrl.includes("challenge");
 
+    // 抓取 Meta Data
     const meta = await page.evaluate(() => {
       const get = (name, attr = "name") => {
         const el = document.querySelector(`meta[${attr}="${name}"]`);
@@ -151,10 +164,9 @@ app.post("/profile", async (req, res) => {
 
     const html = await page.content();
 
-    // 1) HTML JSON count 優先
+    // 1) HTML JSON count
     const fromHtml = extractCountsFromHtml(html);
-
-    // 2) meta 文字 fallback
+    // 2) Meta text fallback
     const fromMeta = extractCountsFromMetaText(raw);
 
     const numbers = {
@@ -172,15 +184,16 @@ app.post("/profile", async (req, res) => {
       parsed: numbers,
       debug: {
         looksLogin,
-        source:
-          (fromHtml.followers || fromHtml.following || fromHtml.posts) ? "html_json" : "meta_text_or_null",
+        source: (fromHtml.followers || fromHtml.following || fromHtml.posts) ? "html_json" : "meta_text_or_null",
+        usingCookie: !!process.env.IG_SESSION_ID
       },
-      note:
-        looksLogin
-          ? "Redirected to login/challenge. Counts may be unavailable without authenticated session."
-          : "Parsed via HTML JSON first; fallback to meta description.",
+      note: looksLogin
+        ? "Redirected to login. Please update IG_SESSION_ID in Zeabur variables."
+        : "Success.",
     });
+
   } catch (e) {
+    console.error(e);
     res.status(500).json({ error: String(e?.message || e) });
   } finally {
     if (browser) await browser.close();
