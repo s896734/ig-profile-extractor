@@ -63,5 +63,5 @@ app.post("/profile", async (req, res) => {
   }
 });
 
-const port = process.env.PORT ? Number(process.env.PORT) : 3000;
-app.listen(port, () => console.log(`Server listening on ${port}`));
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, '0.0.0.0', () => console.log('listening on', PORT));
